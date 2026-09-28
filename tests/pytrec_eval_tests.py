@@ -1,6 +1,9 @@
 import collections
+import json
 import os
 import re
+import subprocess
+import sys
 import unittest
 
 import pytrec_eval
@@ -321,6 +324,78 @@ class PyTrecEvalUnitTest(unittest.TestCase):
         # empty everything
         evaluator = pytrec_eval.RelevanceEvaluator({}, {})
         self.assertEqual(evaluator.evaluate({}), {})
+
+    def test_empty_qrels_c_extension(self):
+        # The Python wrapper drops queries without judgments, so call the C
+        # extension directly. trec_eval used to read the relevance of the
+        # (uninitialised) end marker of an empty qrels list; depending on the
+        # heap contents this crashed, hung, or corrupted the scores of all
+        # later queries (https://github.com/cvangysel/pytrec_eval/issues/57,
+        # https://github.com/embeddings-benchmark/mteb/issues/3030). As the
+        # heap contents depend on the process, check several fresh
+        # interpreters. On glibc, MALLOC_PERTURB_ (with the tcache disabled,
+        # as tcache allocations are not perturbed) fills new allocations with
+        # a non-zero byte, which triggers the bug deterministically; other
+        # platforms ignore these variables.
+        script = (
+            'import json, pytrec_eval_ext\n'
+            'qrel = {"q1": {"d1": 1, "d2": 1}, "q2": {},'
+            ' "q3": {"d1": 1, "d3": 1}, "q4": {"d2": 1}}\n'
+            'run = {q: {"d1": 3.0, "d2": 2.0, "d3": 1.0} for q in qrel}\n'
+            'ev = pytrec_eval_ext.RelevanceEvaluator(qrel, {"P.1", "ndcg_cut.3"})\n'
+            'print(json.dumps(ev.evaluate(run)))\n')
+        expected = {
+            'q1': {'P_1': 1.0, 'ndcg_cut_3': 1.0},
+            'q2': {'P_1': 0.0, 'ndcg_cut_3': 0.0},
+            'q3': {'P_1': 1.0, 'ndcg_cut_3': 0.9197207891481876},
+            'q4': {'P_1': 0.0, 'ndcg_cut_3': 0.6309297535714575},
+        }
+        environments = [{'PYTHONHASHSEED': str(seed)} for seed in range(8)]
+        environments += [{'PYTHONHASHSEED': '0', 'MALLOC_PERTURB_': str(byte),
+                          'GLIBC_TUNABLES': 'glibc.malloc.tcache_count=0'}
+                         for byte in (1, 128)]
+        for extra_env in environments:
+            with self.subTest(**extra_env):
+                proc = subprocess.run(
+                    [sys.executable, '-c', script],
+                    env=dict(os.environ, **extra_env),
+                    capture_output=True, text=True, timeout=120)
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                result = json.loads(proc.stdout)
+                self.assertEqual(result.keys(), expected.keys())
+                for qid, measures in expected.items():
+                    for measure, value in measures.items():
+                        self.assertAlmostEqual(
+                            result[qid][measure], value, msg=(qid, measure))
+
+    def test_empty_ranking_in_fresh_process(self):
+        # An empty ranking must not be reported as a trec_eval failure, also
+        # when it is the very first thing evaluated in a process.
+        script = (
+            'import json, pytrec_eval\n'
+            'ev = pytrec_eval.RelevanceEvaluator('
+            '{"q1": {"d1": 1, "d2": 1}}, {"num_ret", "recall.10", "ndcg"})\n'
+            'print(json.dumps(ev.evaluate({"q1": {}})))\n')
+        proc = subprocess.run([sys.executable, '-c', script],
+                              capture_output=True, text=True, timeout=120)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        result = json.loads(proc.stdout)['q1']
+        self.assertEqual(result['num_ret'], 0.0)
+        self.assertEqual(result['recall_10'], 0.0)
+        self.assertEqual(result['ndcg'], 0.0)
+
+    def test_failed_measure_raises(self):
+        # A relevance level this large makes trec_eval's allocation fail. This
+        # used to be ignored, and every query evaluated afterwards silently
+        # got stale values (here: q2 scored 0 instead of 1).
+        evaluator = pytrec_eval.RelevanceEvaluator(
+            {'q1': {'d1': 10 ** 12}, 'q2': {'d1': 1}}, {'P.1', 'ndcg'})
+        with self.assertRaises(RuntimeError):
+            evaluator.evaluate({'q1': {'d1': 1.0}, 'q2': {'d1': 1.0}})
+        # The evaluator is still usable afterwards.
+        self.assertEqual(
+            evaluator.evaluate({'q2': {'d1': 1.0}}),
+            {'q2': {'P_1': 1.0, 'ndcg': 1.0}})
 
     def test_measure_params(self):
         qrel = {

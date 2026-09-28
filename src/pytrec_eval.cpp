@@ -177,7 +177,10 @@ class RankingBuilder {
 
                 ++pair_idx;
             }
-            query_document_pairs[pair_idx].docno = NULL;
+            // Zero the whole end marker, not just docno: trec_eval reads the
+            // first entry's relevance even when a query has no judgments, so
+            // for an empty dict it must not see uninitialised memory.
+            memset(&query_document_pairs[pair_idx], 0, sizeof(PairT));
 
             if (!ProcessListOfQueryDocumentPairs(&query_pair_list[query_idx],
                                                  PyDict_Size(value),
@@ -621,7 +624,7 @@ static PyObject* RelevanceEvaluator_evaluate(RelevanceEvaluator* self, PyObject*
     q_eval.num_queries = 0;
 
     // Holds the result.
-    PyObject* const result = PyDict_New();
+    PyObject* result = PyDict_New();
 
     for (size_t result_query_idx = 0;
          result_query_idx < num_queries;
@@ -649,12 +652,29 @@ static PyObject* RelevanceEvaluator_evaluate(RelevanceEvaluator* self, PyObject*
             }
 
             // Compute measure.
-            te_trec_measures[measure_idx]->calc_meas(
+            const int calc_status = te_trec_measures[measure_idx]->calc_meas(
                 &self->epi_,
                 &self->all_rel_info_.rel_info[eval_query_idx],
                 &all_results.results[result_query_idx],
                 te_trec_measures[measure_idx],
                 &q_eval);
+
+            // Never return the values left in q_eval (or trec_eval's
+            // per-query cache) after a failed computation. Exception: for an
+            // empty ranking, trec_eval versions whose te_chk_and_malloc returns
+            // NULL for a request of 0 items report UNDEF when nothing was
+            // allocated yet; keep the previous behaviour (all zeros) there.
+            const long num_ranked = ((TEXT_RESULTS_INFO*)
+                all_results.results[result_query_idx].q_results)->num_text_results;
+            if (calc_status == UNDEF && num_ranked > 0) {
+                PyErr_Format(
+                    PyExc_RuntimeError,
+                    "trec_eval failed to compute measure %s for query %s.",
+                    te_trec_measures[measure_idx]->name, qid.c_str());
+                Py_DECREF(query_measures);
+                Py_CLEAR(result);
+                break;
+            }
 
             CHECK_GE(te_trec_measures[measure_idx]->eval_index, 0);
 
@@ -694,6 +714,10 @@ static PyObject* RelevanceEvaluator_evaluate(RelevanceEvaluator* self, PyObject*
             }
 
             accum_eval.num_queries++;
+        }
+
+        if (result == NULL) {
+            break;
         }
 
         PyDict_SetItemAndSteal(
